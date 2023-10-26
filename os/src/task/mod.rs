@@ -16,6 +16,7 @@ mod task;
 
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_us;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -23,6 +24,10 @@ use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
+use crate::config::MAX_SYSCALL_NUM;
+
+use crate::mm::{self, MapPermission};
+
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -79,6 +84,8 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
+        next_task.time = get_time_us();
+
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -140,6 +147,10 @@ impl TaskManager {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
+            if inner.tasks[next].time == 0 {
+                inner.tasks[next].time = get_time_us();
+            }
+
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -153,6 +164,81 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    fn record_syscall(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id] += 1;
+    }
+
+    fn get_current_task_info(&self) -> (TaskStatus, [u32; MAX_SYSCALL_NUM], usize) {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let current = &inner.tasks[current];
+
+        let mut syscall_times: [u32; MAX_SYSCALL_NUM] = [0; MAX_SYSCALL_NUM];
+        for i in 0..current.syscall_times.len() {
+            syscall_times[i] = current.syscall_times[i] as u32;
+        }
+
+        (
+            current.task_status,
+            syscall_times,
+            get_time_us() - current.time
+        )
+    }
+
+    /// ch4
+    fn mmap(&self,start: usize, len: usize, port: usize) -> isize {
+        let start_va = mm::VirtAddr(start);
+        let end_va = mm::VirtAddr(start+len);
+        // handle flags
+        let map_permission = MapPermission::from_bits((port as u8) << 1).unwrap() | MapPermission::U;
+
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let tcb = &mut inner.tasks[current];
+
+        for vpn in mm::VPNRange::new(mm::VirtPageNum::from(start_va), end_va.ceil()){
+            if let Some(pte) =  tcb.memory_set.translate(vpn){
+                if pte.is_valid(){
+                    return -1;
+                }
+            }
+        }
+
+        tcb.memory_set.insert_framed_area(start_va, end_va, map_permission);
+
+        0
+    }
+
+    /// ch4
+    fn munmap(&self,_start: usize, _len: usize) -> isize {
+        let start_va = mm::VirtAddr(_start);
+        let end_va = mm::VirtAddr(_start+_len);
+
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let tcb = &mut inner.tasks[current];
+
+        for vpn in mm::VPNRange::new(mm::VirtPageNum::from(start_va), end_va.ceil()){
+            match tcb.memory_set.translate(vpn) {
+                Some(pte) => {
+                    if pte.is_valid() == false {
+                        return -1;
+                    }
+                },
+                None => {
+                    return -1;
+                }
+            }
+        }
+
+        tcb.memory_set.delete_frame_area(start_va, end_va);
+
+        0
+    }
+
 }
 
 /// Run the first task in task list.
@@ -201,4 +287,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// record syscall times
+pub fn record_syscall(syscall_id: usize) {
+    TASK_MANAGER.record_syscall(syscall_id)
+}
+
+/// get current task info
+pub fn get_current_task_info() -> (TaskStatus, [u32; MAX_SYSCALL_NUM], usize) {
+    TASK_MANAGER.get_current_task_info()
+}
+
+/// ch4: mmap
+pub fn mmap(start: usize, len: usize, port: usize) -> isize {
+    TASK_MANAGER.mmap(start,len,port)
+}
+
+/// ch4: munmap
+pub fn munmap(start: usize, len: usize) -> isize {
+    TASK_MANAGER.munmap(start, len)
 }
