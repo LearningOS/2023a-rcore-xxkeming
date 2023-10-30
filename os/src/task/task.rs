@@ -3,7 +3,7 @@ use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE, MapPermission, VirtPageNum, VPNRange };
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
@@ -191,6 +191,7 @@ impl TaskControlBlock {
         let pid_handle = pid_alloc();
         let kernel_stack = kstack_alloc();
         let kernel_stack_top = kernel_stack.get_top();
+
         // copy fd table
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
         for fd in parent_inner.fd_table.iter() {
@@ -200,6 +201,7 @@ impl TaskControlBlock {
                 new_fd_table.push(None);
             }
         }
+
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             kernel_stack,
@@ -261,6 +263,127 @@ impl TaskControlBlock {
             None
         }
     }
+
+     /// ch5: mmap
+     pub fn mmap(self: &Arc<TaskControlBlock>, start: usize, len: usize, _port: usize) -> isize {
+
+        let start_va = VirtAddr(start);
+        let end_va = VirtAddr(start + len);
+        // handle flags
+        let map_permission =
+            MapPermission::from_bits((_port as u8) << 1).unwrap() | MapPermission::U;
+
+        let mut inner = self.inner_exclusive_access();
+
+        // check if pages have been mapped
+        for vpn in VPNRange::new(VirtPageNum::from(start_va), end_va.ceil()) {
+            if let Some(pte) = inner.memory_set.translate(vpn) {
+                if pte.is_valid() {
+                    return -1;
+                }
+            }
+        }
+
+        inner.memory_set.insert_framed_area(start_va, end_va, map_permission);
+
+        0
+    }
+
+
+    /// ch5: munmap
+    pub fn munmap(self: &Arc<TaskControlBlock>, start: usize, len: usize) -> isize {
+        let start_va = VirtAddr(start);
+        let end_va = VirtAddr(start + len);
+
+        let mut inner = self.inner_exclusive_access();
+
+        for vpn in VPNRange::new(VirtPageNum::from(start_va), end_va.ceil()) {
+            match inner.memory_set.translate(vpn) {
+                Some(pte) => {
+                    if pte.is_valid() == false {
+                        return -1;
+                    }
+                }
+                None => {
+                    return -1;
+                }
+            }
+        }
+
+        inner.memory_set.remove_area_with_start_vpn(VirtPageNum::from(start_va));
+
+        0
+    }
+
+
+
+    /// ch5: spawn
+    pub fn spawn(self: &Arc<TaskControlBlock>, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+
+        // get parent inner exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+
+        // memory_set with elf program headers/trampoline/trap context/user stack
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+
+        // copy fd table
+        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+        for fd in parent_inner.fd_table.iter() {
+            if let Some(file) = fd {
+                new_fd_table.push(Some(file.clone()));
+            } else {
+                new_fd_table.push(None);
+            }
+        }
+
+        // push a taskcontext which goes to trap_return to the top of kernel stack
+        let task_control_block = Arc::new(Self {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: new_fd_table,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                })
+            },
+        });
+
+        // add the pcb to chain of parent's child
+        parent_inner.children.push(task_control_block.clone());
+
+        // prepare TrapContext in user space
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+
+        task_control_block
+    }
+
 }
 
 #[derive(Copy, Clone, PartialEq)]
